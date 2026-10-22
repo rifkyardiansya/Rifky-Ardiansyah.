@@ -1,0 +1,102 @@
+# =====================================================================
+#  Continuous Deployment
+#  Deploy ke VPS (Docker Compose) setelah CI hijau pada branch main.
+#
+#  Secret yang perlu disiapkan di GitHub -> Settings -> Secrets:
+#    VPS_HOST, VPS_USER, VPS_SSH_KEY, APP_DIR, APP_DOMAIN
+# =====================================================================
+name: CD
+
+on:
+  push:
+    tags: ['v*.*.*']
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment'
+        required: true
+        default: 'production'
+
+concurrency:
+  group: cd-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy ke Server
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: production
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          port: 22
+          script: |
+            set -euo pipefail
+            APP_DIR="${{ secrets.APP_DIR }}"
+            cd "$APP_DIR"
+
+            echo "▸ Menarik perubahan repository…"
+            git pull --ff-only origin main
+
+            echo "▸ Menjalankan test sebelum deploy…"
+            npm ci --omit=dev
+            npm run db:seed
+
+            echo "▸ Memulai container…"
+            docker compose -f docker-compose.yml -f docker-compose.prod.yml pull || true
+            docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build --remove-orphans
+
+            echo "▸ Menunggu health check…"
+            for i in $(seq 1 30); do
+              if curl -fsS "http://127.0.0.1/api/health" > /dev/null 2>&1; then
+                echo "Health check OK"
+                break
+              fi
+              if [ "$i" -eq 30 ]; then
+                echo "Health check gagal setelah 30 percobaan"
+                docker compose logs --tail=100 app
+                exit 1
+              fi
+              sleep 5
+            done
+
+            echo "▸ Membersihkan image lama…"
+            docker image prune -f --filter "until=168h"
+            docker compose ps
+
+      - name: Verifikasi Deployment
+        run: |
+          set -e
+          URL="${{ secrets.APP_DOMAIN }}"
+          echo "Memeriksa ${URL}/api/health …"
+          for i in $(seq 1 20); do
+            CODE=$(curl -s -o /dev/null -w '%{http_code}' "https://${URL}/api/health" || echo 000)
+            if [ "$CODE" = "200" ]; then
+              echo "Deployment sukses"
+              curl -fsS "https://${URL}/api/health"
+              exit 0
+            fi
+            echo "Percobaan ${i}: HTTP ${CODE}"
+            sleep 6
+          done
+          echo "Verifikasi gagal"
+          exit 1
+
+      - name: Notifikasi Ringkasan
+        if: always()
+        run: |
+          {
+            echo "### Deploy Restoran Nusantara"
+            echo ""
+            echo "- Commit : \`${{ github.sha }}\`"
+            echo "- Versi  : \`${{ github.ref_name }}\`"
+            echo "- Status : ${{ job.status }}"
+          } >> "$GITHUB_STEP_SUMMARY"
